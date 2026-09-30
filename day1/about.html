@@ -70,19 +70,40 @@
 
         <section>
             <h2>Send feedback</h2>
-             <form id="note-form">
-             <label for="note-input">New note</label>
+             <form id="feedback-form">
+             <label for="user-name">Name:</label>
              <input
              type="text"
-             id="note-input"
-             name="note"
-             placeholder="What do you want to remember?"
+             id="user-name"
+             name="name"
+             placeholder="Your full name"
              required
              />
-             <button type="submit">Add Note</button>
-             </form>  
+             
 
-        </section>
+               
+        <label for="user-email">Email:</label>
+        <input 
+            type="email" 
+            id="user-email" 
+            name="email" 
+            placeholder="Your email address" 
+            required 
+        />
+
+        
+        <label for="user-message">Message:</label>
+        <textarea 
+            id="user-message" 
+            name="message" 
+            placeholder="How can we help you?" 
+            required
+        ></textarea>
+
+    
+        <button type="submit">Submit Feedback</button>
+     </form>
+     </section>
     </main>
 
     <footer>
