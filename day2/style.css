@@ -9,6 +9,13 @@ body {
     background-color: #f4f4f9;
     color: #333;
     line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+}
+
+html, body {
+        height: 100%;
+        margin: 0;
 }
 
 header {
@@ -28,6 +35,7 @@ main {
     max-width: 1000px;
     margin: 2rem auto; 
     padding: 0 1rem;
+    flex: 1;
     
 }
 
