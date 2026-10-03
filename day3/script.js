@@ -62,6 +62,11 @@ function addNote(text, category) {
     return false;
   }
 
+  if (isDuplicate(text)) { 
+    console.log("Failed to add note: A note with duplicate text already exists.");
+    return false;
+  }
+
   if (!allowedCategories.includes(category)) {
     console.log(`Failed to add note: Category must be one of ${allowedCategories.join(", ")}.`);
     return false;
