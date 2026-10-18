@@ -17,3 +17,7 @@
 
 - **Index Recommendation**: Create an index on `students(name)`.
 - **Reason**: Our business logic regularly looks up records filtering by a student's full name (such as in Query 1). Indexing this field changes lookup performance from an \(O(N)\) full-table scan to an \(O(\log N)\) fast lookup, accelerating queries significantly as enrollment grows across campuses.
+
+## Architectural Architecture: SQL vs NoSQL
+
+For this specific school tracking framework, a relational **SQL database** is undeniably the optimal architectural choice. School record systems rely heavily on structured relations where transaction accuracy, schema strictness, and strict data consistency (ACID compliance) are critical. Features like cascading updates/deletes ensure that if a course or student record is dropped, phantom orphans are prevented automatically. A NoSQL setup would struggle with these tightly coupled relations, leading to duplicated data variants and manually managed integrity across independent documents.
