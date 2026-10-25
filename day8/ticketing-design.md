@@ -1,4 +1,4 @@
-# TicketHub: System Design Document
+# TicketHub: Comprehensive System Design Document
 
 ## 1. System Requirements
 
@@ -13,42 +13,85 @@
 ### Non-Functional Requirements
 
 - **Speed (Low Latency):** Page loads and seat selections must take under 200ms, even during sudden traffic spikes, to prevent user frustration.
-- **Correctness (Consistency):** Strict data consistency is required. A seat must never be double-booked or sold to more than one user.
+- **Correctness (Consistency):** Strict transactional consistency is required. A seat must never be double-booked or sold to more than one user.
 - **Fairness (Concurrency Control):** First-come, first-served access during flash sales. No user should be bypassed due to race conditions or system favoritism.
 - **High Availability:** The system must maintain 99.99% uptime, especially the browsing and ticket retrieval paths, during high-demand sales events.
 
 ---
 
-## 2. Traffic & Load Estimates
+## 2. Traffic Analytics & Sizing Calculations
 
-### Normal Traffic
+### Traffic Volume Assertions
 
-- **Daily Visitors:** 50,000 unique users.
-- **Total Page Views:** 50,000 users × 10 pages/user = 500,000 page views per day.
-- **Average Requests Per Second (RPS):** 500,000 requests / 86,400 seconds ≈ **5.8 RPS**.
-- **Daily Sales Volume:** 5,000 tickets sold per day.
+- **Normal Baseline Traffic:** 50,000 unique active users per day.
+- **Normal Interaction Load:** 50,000 users × 10 pages/user = 500,000 requests per day.
+- **Normal Baseline Throughput:** 500,000 requests / 86,400 seconds ≈ **5.8 Requests Per Second (RPS)**.
+- **Peak Surge Traffic ("Big Sale"):** 200,000 concurrent users competing for 20,000 highly coveted event seats.
+- **Peak Dynamic Load:** Each user is assumed to refresh, click, poll, or submit checkout requests 10 times during a high-anxiety 10-minute window (600 seconds).
+- **Peak Dynamic Interaction Throughput:** (200,000 users × 10 requests) / 600 seconds ≈ **3,333 RPS**.
+- **The Scale Volatility:** This indicates a massive **~550x surge** over baseline operations within seconds of ticket release.
 
-### "Big Sale" Peak Traffic
+### Database Sizing Estimates
 
-- **Target Audience:** 200,000 concurrent users competing for 20,000 seats.
-- **Time Window:** 10 minutes (600 seconds).
-- **Estimated Interaction Rate:** Assuming each user performs approximately 10 actions (refreshing, selecting seats, clicking buy) during this high-anxiety window:
-  - Total Requests = 200,000 users × 10 requests = 2,000,000 requests.
-- **Peak Requests Per Second (RPS):** 2,000,000 requests / 600 seconds ≈ **3,333 RPS**.
-
-### Traffic Comparison
-
-- **The Scale Jump:** Traffic surges from a baseline of ~6 RPS to a massive **3,333 RPS** during a popular concert release.
-- **The Challenge:** This represents a **~550x increase** in sudden load. Standard relational database writes will bottleneck immediately under this pressure without caching and queue architectures.
+- **Data Payload Constraints:**
+  - A standard `order` record (UUID, Foreign Keys, Timestamp, Status String) consumes approximately 200 bytes of structured data.
+  - A final ticket voucher object with strings and metadata consumes approximately 300 bytes.
+- **Peak Write Sizing Strategy:** Processing 20,000 successful ticket checkouts generates:
+  - 20,000 orders × 200 bytes = 4,000,000 bytes (~4 MB).
+  - 20,000 tickets × 300 bytes = 6,000,000 bytes (~6 MB).
+- **Throughput Capacity Planning:** While 10 MB of cold static database writes is trivial for a relational database, processing thousands of unbuffered write requests per second _simultaneously_ will exhaust the database connection pool. The storage capacity must support continuous write bursts of **3,333 RPS** hitting transactional safety limits.
 
 ---
 
-## 3. API Design
+## 3. End-to-End Sequential Architecture Blueprint
+
+This diagram illustrates how data flows sequentially from the user through the stack, splitting clean path execution into **Reads (High-Speed Memory Verification)** and **Writes (Asynchronous Message Queues)**.
+
+[ Users (Web / Mobile App clients) ]
+│
+▼ (HTTPS / TLS Termination)
+[ Edge Caching Layer (CDN / Cloudflare) ]
+(Serves static assets & event media)
+│
+▼
+[ Nginx Load Balancer ]
+(Round-robin traffic distribution)
+│
+┌─────────────────────────┴─────────────────────────┐
+▼ (HTTP API Requests) ▼
+[ App Instance 1 ] [ App Instance 2 ]
+(Stateless Web Tier) (Stateless Web Tier)
+│ │
+├───────────────────────────────────────────────────┤
+▼ ▼
+┌─────────────────────────────────┐ ┌─────────────────────────────────┐
+│ READ PATH (High-Speed) │ │ WRITE PATH (Asynchronous) │
+│ [ Redis Cache Layer ] │ │ [ RabbitMQ Message Queue ] │
+│ │ │ │
+│ • INPUT: Key-Value checks for │ │ • INPUT: Unprocessed order text│
+│ instant seat configurations │ │ and user checkout payloads │
+│ • OUTPUT: Serves layout map data│ │ • OUTPUT: Sequential buffered │
+│ directly from memory (<20ms) │ │ jobs sent to backend workers │
+└────────────────┬────────────────┘ └────────────────┬────────────────┘
+│ │
+└─────────────────────────┬─────────────────────────┘
+▼
+[ Worker Services ]
+(Validates queue background jobs)
+│
+┌─────────────────────────────────┴─────────────────────────────────┐
+▼ (Strict Transactional SQL Writes) ▼ (Protected HTTP/JSON)
+[ PostgreSQL Relational Database ] [ External M-Pesa API Gateway ]
+(Users, Finalized Bookings, Orders) (STK Push billing transaction)
+
+---
+
+## 4. API Design
 
 ### 1. Browse Events
 
 - **Endpoint:** `GET /api/v1/events`
-- **Query Params:** `page=1&limit=20&search=Sauti+Sol`
+- **Query Params:** `page=1&limit=20&search=De+Matthew`
 - **Response (200 OK):**
 
 ```json
@@ -141,11 +184,13 @@
 
 ---
 
-## 4. Database Schema
+## 5. Relational Database Schema & Data Models
 
-We use a Relational Database (like PostgreSQL) to handle strict transactions for payments and orders, coupled with a fast caching layer (Redis) for real-time seat locks.
+Our storage tier uses a relational schema to guarantee strong reference tracking across models.
 
 ### `users` Table
+
+- **Purpose:** Stores customer profile configurations.
 
 | Column Name | Data Type    | Constraints        |
 | :---------- | :----------- | :----------------- |
@@ -156,6 +201,8 @@ We use a Relational Database (like PostgreSQL) to handle strict transactions for
 
 ### `events` Table
 
+- **Purpose:** Stores immutable show dates and venue descriptions.
+
 | Column Name  | Data Type    | Constraints |
 | :----------- | :----------- | :---------- |
 | `id`         | VARCHAR(36)  | PRIMARY KEY |
@@ -165,14 +212,19 @@ We use a Relational Database (like PostgreSQL) to handle strict transactions for
 
 ### `seats` Table
 
-| Column Name  | Data Type   | Constraints                                 |
-| :----------- | :---------- | :------------------------------------------ |
-| `id`         | VARCHAR(36) | PRIMARY KEY                                 |
-| `event_id`   | VARCHAR(36) | FOREIGN KEY references `events(id)`         |
-| `seat_label` | VARCHAR(10) | NOT NULL                                    |
-| `version`    | INT         | NOT NULL DEFAULT 1 (For Optimistic Locking) |
+- **Purpose:** Tracks seat coordinate availability. High throughput reads mirror this schema inside memory strings.
+
+| Column Name  | Data Type   | Constraints                                |
+| :----------- | :---------- | :----------------------------------------- |
+| `id`         | VARCHAR(36) | PRIMARY KEY                                |
+| `event_id`   | VARCHAR(36) | FOREIGN KEY references `events(id)`        |
+| `seat_label` | VARCHAR(10) | NOT NULL                                   |
+| `status`     | VARCHAR(20) | NOT NULL DEFAULT 'AVAILABLE'               |
+| `version`    | INT         | NOT NULL DEFAULT 1 (Optimistic Lock Field) |
 
 ### `orders` Table
+
+- **Purpose:** Captures the core billing transaction state linked to payment confirmations.
 
 | Column Name  | Data Type   | Constraints                         |
 | :----------- | :---------- | :---------------------------------- |
@@ -184,73 +236,69 @@ We use a Relational Database (like PostgreSQL) to handle strict transactions for
 
 ---
 
-## 5. Preventing Double-Booking
+## 6. Concurrency Control: Preventing Double-Booking
 
-To eliminate race conditions where two users attempt to purchase the exact same seat simultaneously, we leverage database-level constraints and memory-cache atomicity.
+To securely manage 3,333 RPS competing for identical records without double-booking, the application relies on an explicit, two-layered isolation process.
 
-### In-Memory Distributed Locks (Redis)
+### Step 1: Atomic In-Memory Locks (Redis)
 
-Before touching the primary database, seat availability is evaluated in Redis using an atomic transaction.
+Before a request can reach the primary disk database, the application server attempts to claim an atomic key inside Redis using the `SETNX` (Set if Not Exists) directive:SET event:9982:seat:A1 user_4545 EX 600 NX
 
-1. When a user selects a seat, the system runs a Redis `SETNX` (Set if Not Exists) command:
-   `SET event:9982:seat:A1 user_4545 EX 600 NX`
-2. If this returns `1`, the user successfully secures a 10-minute hold. If it returns `0`, the seat is already locked, and the transaction is safely aborted before hitting the disk.
+- **Success (Returns 1):** The user receives a temporary 10-minute hold window.
+- **Failure (Returns 0):** The seat is already claimed. The transaction stops immediately and returns a "Seat Held" state to the client without placing any write load on our persistent database.
 
-### Database Constraints and Transactions
+### Step 2: Optimistic Concurrency Control (OCC)
 
-If the Redis lock is verified, a transactional multi-row database write updates the status:
+When the user completes payment, our worker processes the transaction. To prevent a race condition without slowing down the database with massive row locks, we use **Optimistic Locking** via the `version` column:
 
-1. We run the operations inside a strict **ACID Database Transaction** (`BEGIN ... COMMIT`).
-2. We employ **Optimistic Concurrency Control (OCC)** using the `version` column in our `seats` table:
-   ```sql
-   UPDATE seats
-   SET status = 'RESERVED', version = version + 1
-   WHERE id = 'ST-A1' AND version = 1;
-   ```
-3. If another query updated the row first, the version would be `2`, the update statement would affect `0` rows, and the system would safely roll back the transaction, letting the user know the seat is no longer available.
+```sql
+UPDATE seats
+SET status = 'RESERVED', version = version + 1
+WHERE id = 'ST-A1' AND version = 1;
+```
+
+If two requests bypass Redis simultaneously due to a cache connection reset, only the first statement executed will find `version = 1` and alter the row. The second statement will find `version = 2`, modify `0` rows, and trigger an explicit transactional rollback to safely reject the duplicate booking.
 
 ---
 
-## 6. Architecture & Scalability Strategy
+## 7. Third-Party Integration Risk Management
 
-### Structural Blueprint
+Integrating external systems like the **M-Pesa API Gateway** introduces unpredictable network latencies. If the M-Pesa platform experiences slow performance, client request threads can easily become blocked waiting for responses, causing a complete system outage. We protect TicketHub using three software safety patterns
 
-[ Users (Mobile / Web) ]
-│
+[ Incoming Payment ] ──> [ Circuit Breaker (CLOSED) ] ──> [ Async Worker Task ] ──> [ M-Pesa API ]
+│ (If failures > 50%)
 ▼
-[ Nginx Load Balancer ]
-│
-┌──────┴──────┐
-▼ ▼
-[ App Server ] [ App Server ] <-- Node.js / Express
-│ │
-├─────────────┴──────┐
-▼ ▼
-[ Redis Cache ] [ RabbitMQ Queue ]
-(Seat Locks & (M-Pesa Checkout
-Fast Browsing) Processing)
-│ │
-└─────────────┬──────┘
-▼
-[ PostgreSQL Database ]
-(Users & Paid Orders)
+[ Circuit Breaker (OPEN) ] ──> [ Graceful Fallback / Instant Error ]
 
-### Surviving the Big Sale High-Load
+### 1. The Circuit Breaker Pattern
 
-- **Stateless Horizontal Scaling:** The application servers run inside Docker containers managed with auto-scaling rules. As incoming requests hit the Nginx load balancer, new containers spin up dynamically to spread the computational burden.
-- **Aggressive Read Caching:** During the 10-minute peak, 90% of requests are simply browsing events and layout maps. We store the event schema and real-time seat states directly in a Redis cluster to serve reads directly out of memory, shielding PostgreSQL.
-- **Asynchronous Queue-Based Checkout:** Instead of keeping an open database connection alive while waiting for the network round-trip of an external M-Pesa payment confirmation, checkout requests are offloaded into a message queue (RabbitMQ). Workers consume messages at a safe, controlled pace to update database states sequentially.
+We wrap our outbound HTTP requests to the payment API inside a circuit breaker middleware (e.g., using open-source libraries like `Opossum` or custom tracking state variables).
+
+- **Normal Mode (Closed):** Requests stream out normally to M-Pesa.
+- **Failure Mode (Open):** If our outbound calls to M-Pesa fail or time out more than 50% of the time over a 30-second window, the circuit breaker trips **OPEN**.
+- **Protection:** For the next 60 seconds, all subsequent checkout payments fail instantly at our application boundary _without_ waiting for M-Pesa or exhausting server memory. This keeps our application server responsive for users who are simply trying to browse events or view their existing tickets.
+
+### 2. Idempotent Message Deduplication
+
+M-Pesa uses asynchronous STK Push callbacks to confirm successful transactions. If network noise causes their system to send duplicate webhook notifications for a single transaction, our application could generate duplicate tickets. We eliminate this risk by enforcing strict database idempotency:
+
+- Every payment payload contains a unique `CheckoutRequestID`.
+- We track these identifiers inside an idempotent database ledger. If a callback arrives with a `CheckoutRequestID` that has already been marked as processed, our server completely ignores the duplicate database write and returns a `200 OK` response to the payment gateway.
+
+### 3. Asynchronous Worker Timeouts & Retries
+
+Outbound API requests use explicit, short connection timeouts capped at **5000ms**. If an API callback fails due to a temporary dropped packet, the task is dropped back into a retry queue in RabbitMQ with an exponential backoff strategy (retrying after 2, 4, then 8 minutes) rather than keeping an active user HTTP thread open and waiting.
 
 ---
 
-## 7. Architectural Trade-offs
+## 8. Architectural Trade-offs & Structural Decisions
 
-### 1. Eventual Consistency vs. Strong Consistency
+### 1. Monolithic Shared Database vs. Microservice Storage Isolation
 
-- **Choice:** We chose **Eventual Consistency** for event browsing layouts but **Strong Consistency** for seat reservations and checkouts.
-- **Trade-off:** A user might occasionally view a cached seat layout that shows a seat as "available" when it was actually reserved a split-second prior. However, this protects our primary database from being completely crushed by hundreds of thousands of read hits during a flash sale. The actual absolute correctness is enforced safely when they click to hold the seat.
+- **Decision:** We chose a single, shared relational database cluster over decoupled microservice databases.
+- **Trade-off:** Microservices with isolated databases look excellent on paper but introduce distributed transaction nightmares. If the ticket service and the user billing service were on isolated databases, ensuring both update simultaneously requires complex two-phase commits. A shared database allows us to use standard, highly reliable ACID transactions. The trade-off is operational—our database becomes a single point of failure that requires vertical hardware scaling.
 
-### 2. High Performance Memory Caching (Redis) vs. Operational Complexity
+### 2. Eventual Consistency (Browsing) vs. Strong Consistency (Checkout)
 
-- **Choice:** Introducing Redis as a distributed lock engine over running everything directly in PostgreSQL.
-- **Trade-off:** This provides incredibly fast lookups capable of easily scaling to 3,000+ RPS. The downside is added infrastructure footprint and operational overhead, as we must implement cache eviction logic and handle edge-case situations where a cache node goes down and requires recovery synchronization.
+- **Decision:** Eventual consistency across search pages, strong consistency for seat configurations.
+- **Trade-off:** Serving event search matrices from Redis cache layouts means a user might see a seat as open when it was actually reserved 5 seconds ago. This slight accuracy trade-off is acceptable because it allows us to handle 3,333 RPS effortlessly. Absolute strong consistency is safely enforced the millisecond they try to claim the lock.
