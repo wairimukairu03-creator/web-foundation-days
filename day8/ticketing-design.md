@@ -91,7 +91,7 @@ This diagram illustrates how data flows sequentially from the user through the s
 ### 1. Browse Events
 
 - **Endpoint:** `GET /api/v1/events`
-- **Query Params:** `page=1&limit=20&search=De+Matthew`
+- **Query Params:** `page=1&limit=20&search=Sauti+Sol`
 - **Response (200 OK):**
 
 ```json
@@ -99,7 +99,7 @@ This diagram illustrates how data flows sequentially from the user through the s
   "events": [
     {
       "id": "evt_9982",
-      "title": "De Matthew Live in Nairobi",
+      "title": "Sauti Sol Live in Nairobi",
       "venue": "KICC",
       "date": "2026-12-12T18:00:00Z",
       "status": "AVAILABLE"
@@ -167,7 +167,7 @@ This diagram illustrates how data flows sequentially from the user through the s
 }
 ```
 
-### 5. View Tickets
+### 5. View Tickets (Retrieval Endpoint)
 
 - **Endpoint:** `GET /api/v1/tickets/{ticket_id}`
 - **Response (200 OK):**
@@ -176,9 +176,9 @@ This diagram illustrates how data flows sequentially from the user through the s
 {
   "ticket_id": "tkt_1102",
   "booking_id": "bk_5541",
-  "event_title": "De Matthew Live in Nairobi",
+  "event_title": "Sauti Sol Live in Nairobi",
   "seat": "Row A, Seat 1",
-  "qr_code_url": "https://ticketinghub.com"
+  "qr_code_url": "https://tickethub.com"
 }
 ```
 
@@ -186,11 +186,11 @@ This diagram illustrates how data flows sequentially from the user through the s
 
 ## 5. Relational Database Schema & Data Models
 
-Our storage tier uses a relational schema to guarantee strong reference tracking across models.
+Our storage tier uses a relational schema with explicit constraints to preserve database entities and enforce structural relationships.
 
 ### `users` Table
 
-- **Purpose:** Stores customer profile configurations.
+- **Purpose:** Stores unique customer profiles.
 
 | Column Name | Data Type    | Constraints        |
 | :---------- | :----------- | :----------------- |
@@ -201,7 +201,7 @@ Our storage tier uses a relational schema to guarantee strong reference tracking
 
 ### `events` Table
 
-- **Purpose:** Stores immutable show dates and venue descriptions.
+- **Purpose:** Stores immutable concert dates and venue locations.
 
 | Column Name  | Data Type    | Constraints |
 | :----------- | :----------- | :---------- |
@@ -212,44 +212,48 @@ Our storage tier uses a relational schema to guarantee strong reference tracking
 
 ### `seats` Table
 
-- **Purpose:** Tracks seat coordinate availability. High throughput reads mirror this schema inside memory strings.
+- **Purpose:** Tracks spatial availability per event. High-throughput reads mirror this inside Redis cache memory.
 
-| Column Name  | Data Type   | Constraints                                |
-| :----------- | :---------- | :----------------------------------------- |
-| `id`         | VARCHAR(36) | PRIMARY KEY                                |
-| `event_id`   | VARCHAR(36) | FOREIGN KEY references `events(id)`        |
-| `seat_label` | VARCHAR(10) | NOT NULL                                   |
-| `status`     | VARCHAR(20) | NOT NULL DEFAULT 'AVAILABLE'               |
-| `version`    | INT         | NOT NULL DEFAULT 1 (Optimistic Lock Field) |
+| Column Name  | Data Type   | Constraints                                           |
+| :----------- | :---------- | :---------------------------------------------------- |
+| `id`         | VARCHAR(36) | PRIMARY KEY                                           |
+| `event_id`   | VARCHAR(36) | FOREIGN KEY REFERENCES `events(id)` ON DELETE CASCADE |
+| `seat_label` | VARCHAR(10) | NOT NULL                                              |
+| `status`     | VARCHAR(20) | NOT NULL DEFAULT 'AVAILABLE'                          |
+| `version`    | INT         | NOT NULL DEFAULT 1                                    |
 
 ### `orders` Table
 
-- **Purpose:** Captures the core billing transaction state linked to payment confirmations.
+- **Purpose:** Captures checkout lifecycle states linked directly to final transactional processing.
 
 | Column Name  | Data Type   | Constraints                         |
 | :----------- | :---------- | :---------------------------------- |
 | `id`         | VARCHAR(36) | PRIMARY KEY                         |
-| `user_id`    | VARCHAR(36) | FOREIGN KEY references `users(id)`  |
-| `event_id`   | VARCHAR(36) | FOREIGN KEY references `events(id)` |
+| `user_id`    | VARCHAR(36) | FOREIGN KEY REFERENCES `users(id)`  |
+| `event_id`   | VARCHAR(36) | FOREIGN KEY REFERENCES `events(id)` |
 | `status`     | VARCHAR(20) | NOT NULL (PENDING, PAID, EXPIRED)   |
-| `created_at` | TIMESTAMP   | NOT NULL                            |
+| `created_at` | TIMESTAMP   | NOT NULL DEFAULT CURRENT_TIMESTAMP  |
 
 ---
 
-## 6. Concurrency Control: Preventing Double-Booking
+## 6. Concurrency Strategy: Preventing Double-Bookings
 
-To securely manage 3,333 RPS competing for identical records without double-booking, the application relies on an explicit, two-layered isolation process.
+To technically guarantee that multiple concurrent users hitting the system at the exact same millisecond cannot claim the same seat, worker services enforce transactional consistency via a two-layer validation framework.
 
-### Step 1: Atomic In-Memory Locks (Redis)
+### Layer 1: Atomic In-Memory Locks (Redis)
 
-Before a request can reach the primary disk database, the application server attempts to claim an atomic key inside Redis using the `SETNX` (Set if Not Exists) directive:SET event:9982:seat:A1 user_4545 EX 600 NX
+Before any transaction touches the disk, application nodes must acquire an atomic distributed lock via Redis using `SETNX` (Set if Not Exists):
 
-- **Success (Returns 1):** The user receives a temporary 10-minute hold window.
-- **Failure (Returns 0):** The seat is already claimed. The transaction stops immediately and returns a "Seat Held" state to the client without placing any write load on our persistent database.
+```text
+SET event:9982:seat:A1 user_4545 EX 600 NX
+```
 
-### Step 2: Optimistic Concurrency Control (OCC)
+- **Success:** If Redis returns `1`, the lock is acquired for 10 minutes.
+- **Failure:** If Redis returns `0`, the seat is already locked. The request is immediately rejected at the API layer, eliminating duplicate write noise down the chain.
 
-When the user completes payment, our worker processes the transaction. To prevent a race condition without slowing down the database with massive row locks, we use **Optimistic Locking** via the `version` column:
+### Layer 2: Optimistic Database Concurrency Control (OCC)
+
+To handle edge-case cache sync errors, worker services enforce strict data-tier verification using the `version` column inside a database transaction block:
 
 ```sql
 UPDATE seats
@@ -257,22 +261,18 @@ SET status = 'RESERVED', version = version + 1
 WHERE id = 'ST-A1' AND version = 1;
 ```
 
-If two requests bypass Redis simultaneously due to a cache connection reset, only the first statement executed will find `version = 1` and alter the row. The second statement will find `version = 2`, modify `0` rows, and trigger an explicit transactional rollback to safely reject the duplicate booking.
+- **The Verification Mechanism:** If two transactions simultaneously attempt to read version `1`, only the one that executes first will find `version = 1` and update the row.
+- **The Safeguard:** The trailing transaction finds that the version has already moved to `2`. The database statement modifies `0` rows, forcing our worker service to capture the discrepancy, execute a strict rollback, and gracefully notify the client that the seat has already been sold. This structurally prevents the generation of duplicate tickets.
 
 ---
 
 ## 7. Third-Party Integration Risk Management
 
-Integrating external systems like the **M-Pesa API Gateway** introduces unpredictable network latencies. If the M-Pesa platform experiences slow performance, client request threads can easily become blocked waiting for responses, causing a complete system outage. We protect TicketHub using three software safety patterns
-
-[ Incoming Payment ] ──> [ Circuit Breaker (CLOSED) ] ──> [ Async Worker Task ] ──> [ M-Pesa API ]
-│ (If failures > 50%)
-▼
-[ Circuit Breaker (OPEN) ] ──> [ Graceful Fallback / Instant Error ]
+Integrating external systems like the **M-Pesa API Gateway** introduces unpredictable network latencies. If the M-Pesa platform experiences slow performance, client request threads can easily become blocked waiting for responses, causing a complete system outage. We protect TicketHub using three software safety patterns:
 
 ### 1. The Circuit Breaker Pattern
 
-We wrap our outbound HTTP requests to the payment API inside a circuit breaker middleware (e.g., using open-source libraries like `Opossum` or custom tracking state variables).
+We wrap our outbound HTTP requests to the payment API inside a circuit breaker middleware.
 
 - **Normal Mode (Closed):** Requests stream out normally to M-Pesa.
 - **Failure Mode (Open):** If our outbound calls to M-Pesa fail or time out more than 50% of the time over a 30-second window, the circuit breaker trips **OPEN**.
